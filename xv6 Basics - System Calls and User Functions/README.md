@@ -1,9 +1,13 @@
 # xv6 Basics
 ### Installing xv6
 1. Clone the original xv6 repository by running  
+	
 	`git clone https://github.com/mit-pdos/xv6-public`
+	
 2. Install an emulator to boot xv6 (here we use qemu)  
+	
 	`sudo apt-install qemu` 
+	
 3. Run xv6
 	- to run in a new terminal: `make qemu`
 	- to run in the same terminal: `make qemu-nox`
