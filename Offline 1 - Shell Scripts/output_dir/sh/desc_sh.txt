@@ -1,3 +1,0 @@
-./dir1/subdir1/script02.sh
-./dir3/script04.sh
-./dir3/script 0 4.sh
