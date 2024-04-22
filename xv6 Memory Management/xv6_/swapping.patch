@@ -1,0 +1,1245 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..4d250df 100644
+--- a/Makefile
++++ b/Makefile
+@@ -181,6 +181,8 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_memtest\
++
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -217,7 +219,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 2
++CPUS := 1
+ endif
+ QEMUOPTS = -drive file=fs.img,index=1,media=disk,format=raw -drive file=xv6.img,index=0,media=disk,format=raw -smp $(CPUS) -m 512 $(QEMUEXTRA)
+ 
+@@ -249,7 +251,7 @@ qemu-nox-gdb: fs.img xv6.img .gdbinit
+ 
+ EXTRA=\
+ 	mkfs.c ulib.c user.h cat.c echo.c forktest.c grep.c kill.c\
+-	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c\
++	ln.c ls.c mkdir.c rm.c stressfs.c usertests.c wc.c zombie.c memtest.c \
+ 	printf.c umalloc.c\
+ 	README dot-bochsrc *.pl toc.* runoff runoff1 runoff.list\
+ 	.gdbinit.tmpl gdbutil\
+@@ -284,3 +286,4 @@ tar:
+ 	(cd /tmp; tar cf - xv6) | gzip >xv6-rev10.tar.gz  # the next one will be 10 (9/17)
+ 
+ .PHONY: dist-test dist
++
+diff --git a/defs.h b/defs.h
+index 82fb982..ac23ee3 100644
+--- a/defs.h
++++ b/defs.h
+@@ -9,6 +9,7 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct pagemeta;
+ 
+ // bio.c
+ void            binit(void);
+@@ -52,6 +53,11 @@ struct inode*   nameiparent(char*, char*);
+ int             readi(struct inode*, char*, uint, uint);
+ void            stati(struct inode*, struct stat*);
+ int             writei(struct inode*, char*, uint, uint);
++int             createSwapFile(struct proc* p);
++int             readFromSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size);
++int             writeToSwapFile(struct proc* p, char* buffer, uint placeOnFile, uint size);
++int             removeSwapFile(struct proc* p);
++int             copySwapFile(struct proc*, struct proc*);
+ 
+ // ide.c
+ void            ideinit(void);
+@@ -120,10 +126,27 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++void            clearPages(struct proc *p);
++void            printPages(struct proc *p);
++int             getNextPhysicalPage(struct proc *p);
++void            addPhysicalPage(struct proc *p, pde_t *pgdir, uint va);
++int             removePhysicalPage(struct proc *p, int index);
++int             getPhysicalPage(struct proc *p, pde_t *pgdir, uint va);
++int             getSwapPage(struct proc *p, pde_t *pgdir, uint va);
++void            removeSwapPage(struct proc *p, int index);
++void            addSwapPage(struct proc *p, int index, pde_t *pgdir, uint va);
++int             getEmptySwapPosition(struct proc *p);
++void            updateAllProcessPTE();
++void            enableaging();
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+ 
++// sysfile
++struct inode*   create(char *path, short type, short major, short minor);
++int             isdirempty(struct inode *dp);
++
++
+ // spinlock.c
+ void            acquire(struct spinlock*);
+ void            getcallerpcs(void*, uint*);
+@@ -185,6 +208,12 @@ void            switchuvm(struct proc*);
+ void            switchkvm(void);
+ int             copyout(pde_t*, uint, void*, uint);
+ void            clearpteu(pde_t *pgdir, char *uva);
++void            copyPagesFromParent(struct proc *parent, struct proc *child);
++void            swapout(struct proc *p);
++void            swapin(struct proc *p, uint va);
++int             checkPageOut(struct proc *p, uint va);
++void            clearPTE_A(struct proc *p);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++
+diff --git a/fs.c b/fs.c
+index f77275f..97d02db 100644
+--- a/fs.c
++++ b/fs.c
+@@ -21,6 +21,12 @@
+ #include "buf.h"
+ #include "file.h"
+ 
++
++// NEW FOR PAGING
++
++#include "fcntl.h"
++#define DIGITS 14
++
+ #define min(a, b) ((a) < (b) ? (a) : (b))
+ static void itrunc(struct inode*);
+ // there should be one superblock per disk device, but we run with
+@@ -668,3 +674,167 @@ nameiparent(char *path, char *name)
+ {
+   return namex(path, 1, name);
+ }
++
++
++char* itoa(int i, char b[]){
++    char const digit[] = "0123456789";
++    char* p = b;
++    if(i<0){
++        *p++ = '-';
++        i *= -1;
++    }
++    int shifter = i;
++    do{ //Move to where representation ends
++        ++p;
++        shifter = shifter/10;
++    }while(shifter);
++    *p = '\0';
++    do{ //Move back, inserting digits as u go
++        *--p = digit[i%10];
++        i = i/10;
++    }while(i);
++    return b;
++}
++
++//remove swap file of proc p;
++int
++removeSwapFile(struct proc* p)
++{
++	//path of proccess
++	char path[DIGITS];
++	memmove(path,"/.swap", 6);
++	itoa(p->pid, path+ 6);
++
++	struct inode *ip, *dp;
++	struct dirent de;
++	char name[DIRSIZ];
++	uint off;
++
++	if(0 == p->swapFile)
++	{
++		return -1;
++	}
++	fileclose(p->swapFile);
++
++	begin_op();
++	if((dp = nameiparent(path, name)) == 0)
++	{
++		end_op();
++		return -1;
++	}
++
++	ilock(dp);
++
++	  // Cannot unlink "." or "..".
++	if(namecmp(name, ".") == 0 || namecmp(name, "..") == 0)
++	   goto bad;
++
++	if((ip = dirlookup(dp, name, &off)) == 0)
++		goto bad;
++	ilock(ip);
++
++	if(ip->nlink < 1)
++		panic("unlink: nlink < 1");
++	if(ip->type == T_DIR && !isdirempty(ip)){
++		iunlockput(ip);
++		goto bad;
++	}
++
++	memset(&de, 0, sizeof(de));
++	if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
++		panic("unlink: writei");
++	if(ip->type == T_DIR){
++		dp->nlink--;
++		iupdate(dp);
++	}
++	iunlockput(dp);
++
++	ip->nlink--;
++	iupdate(ip);
++	iunlockput(ip);
++
++	end_op();
++
++	return 0;
++
++	bad:
++		iunlockput(dp);
++		end_op();
++		return -1;
++
++}
++
++
++//return 0 on success
++int
++createSwapFile(struct proc* p)
++{
++
++
++  char path[DIGITS];
++	memmove(path,"/.swap", 6);
++	itoa(p->pid, path+ 6);
++
++  
++  begin_op();
++  struct inode * in = create(path, T_FILE, 0, 0);
++    
++	iunlock(in);
++
++  
++	p->swapFile = filealloc();
++	if (p->swapFile == 0)
++		panic("no slot for files on /store");
++
++	p->swapFile->ip = in;
++	p->swapFile->type = FD_INODE;
++	p->swapFile->off = 0;
++	p->swapFile->readable = O_WRONLY;
++	p->swapFile->writable = O_RDWR;
++    end_op();
++
++    return 0;
++}
++
++//return as sys_write (-1 when error)
++int
++writeToSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size)
++{
++	p->swapFile->off = placeOnFile;
++
++	return filewrite(p->swapFile, buffer, size);
++
++}
++
++//return as sys_read (-1 when error)
++int
++readFromSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size)
++{
++	p->swapFile->off = placeOnFile;
++
++	return fileread(p->swapFile, buffer,  size);
++}
++
++
++// copy parent swapfile to child swapfile
++int
++copySwapFile(struct proc *parent, struct proc *child)
++{
++  char buffer[PGSIZE];
++  
++  for(int i=0;i<MAX_SWAP_PAGES();i++)
++  {
++    if(parent->swappedPages[i].present){
++      if(readFromSwapFile(parent, buffer, i*PGSIZE, PGSIZE) == -1)
++      {
++        cprintf("Problem reading file\n");
++
++      }
++      if(writeToSwapFile(child, buffer, i*PGSIZE, PGSIZE) == -1)
++      {
++        cprintf("Problem writing in file\n");
++      }
++    }
++  }
++  return 0;
++}
+diff --git a/memlayout.h b/memlayout.h
+index d1615f7..ce46bf2 100644
+--- a/memlayout.h
++++ b/memlayout.h
+@@ -13,3 +13,4 @@
+ 
+ #define V2P_WO(x) ((x) - KERNBASE)    // same as V2P, but without casts
+ #define P2V_WO(x) ((x) + KERNBASE)    // same as P2V, but without casts
++
+diff --git a/mmu.h b/mmu.h
+index a82d8e2..b94e634 100644
+--- a/mmu.h
++++ b/mmu.h
+@@ -62,7 +62,7 @@ struct segdesc {
+ #define STS_IG32    0xE     // 32-bit Interrupt Gate
+ #define STS_TG32    0xF     // 32-bit Trap Gate
+ 
+-// A virtual address 'la' has a three-part structure as follows:
++// A virtual address 'va' has a three-part structure as follows:
+ //
+ // +--------10------+-------10-------+---------12----------+
+ // | Page Directory |   Page Table   | Offset within Page  |
+@@ -95,13 +95,23 @@ struct segdesc {
+ #define PTE_W           0x002   // Writeable
+ #define PTE_U           0x004   // User
+ #define PTE_PS          0x080   // Page Size
++#define PTE_A           0x020   // Accessed
++#define PTE_PG          0x200   // Paged out to secondary storage
++
++// Page storing constants
++#define MAX_PSYC_PAGES  15
++#define MAX_TOTAL_PAGES 30
++#define MAX_SWAP_PAGES() (MAX_TOTAL_PAGES - MAX_PSYC_PAGES)
++#define MAX_PSYC_SIZE() (MAX_PSYC_PAGES * PGSIZE)
++
++// swapping algorithm constants
++#define AGE_BITS 8
+ 
+ // Address in page table or page directory entry
+ #define PTE_ADDR(pte)   ((uint)(pte) & ~0xFFF)
+ #define PTE_FLAGS(pte)  ((uint)(pte) &  0xFFF)
+ 
+ #ifndef __ASSEMBLER__
+-typedef uint pte_t;
+ 
+ // Task state segment format
+ struct taskstate {
+@@ -179,3 +189,4 @@ struct gatedesc {
+ }
+ 
+ #endif
++
+diff --git a/param.h b/param.h
+index a7e90ef..0838c75 100644
+--- a/param.h
++++ b/param.h
+@@ -10,5 +10,6 @@
+ #define MAXOPBLOCKS  10  // max # of blocks any FS op writes
+ #define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+-#define FSSIZE       1000  // size of file system in blocks
++#define FSSIZE       4096  // size of file system in blocks
++
+ 
+diff --git a/proc.c b/proc.c
+index 806b1b1..317b6b1 100644
+--- a/proc.c
++++ b/proc.c
+@@ -20,6 +20,15 @@ extern void trapret(void);
+ 
+ static void wakeup1(void *chan);
+ 
++enum swapalgo {NONE, FIFO, AGING};
++
++enum swapalgo algo = FIFO;
++
++void enableaging(void)
++{
++  algo = AGING;
++}
++
+ void
+ pinit(void)
+ {
+@@ -73,6 +82,16 @@ myproc(void) {
+ static struct proc*
+ allocproc(void)
+ {
++
++  if(algo == AGING)
++  {
++    cprintf("Using LRU (Aging)\n");
++  }
++  else 
++  {
++    cprintf("Using FIFO\n");
++  }
++
+   struct proc *p;
+   char *sp;
+ 
+@@ -112,6 +131,15 @@ found:
+   memset(p->context, 0, sizeof *p->context);
+   p->context->eip = (uint)forkret;
+ 
++  p->pagefaults = 0;
++  
++  // initialize swap page data
++  if(p->pid > 2)
++  {
++    createSwapFile(p);
++    clearPages(p);
++  }
++
+   return p;
+ }
+ 
+@@ -120,6 +148,8 @@ found:
+ void
+ userinit(void)
+ {
++
++  
+   struct proc *p;
+   extern char _binary_initcode_start[], _binary_initcode_size[];
+ 
+@@ -200,6 +230,20 @@ fork(void)
+   np->parent = curproc;
+   *np->tf = *curproc->tf;
+ 
++  np->pagefaults = 0;
++
++  // copy physical and swap page metadata from parent
++  if(curproc->pid > 2)
++  {
++    copySwapFile(curproc, np);
++    copyPagesFromParent(curproc, np);
++    np->qhead = curproc->qhead;
++    np->qtail = curproc->qtail;
++    np->qsize = curproc->qsize;
++  }
++
++
++
+   // Clear %eax so that fork returns 0 in the child.
+   np->tf->eax = 0;
+ 
+@@ -242,6 +286,19 @@ exit(void)
+     }
+   }
+ 
++  cprintf("Exiting proc %d\n", curproc->pid);
++  //printPages(curproc);
++
++  if(curproc->pid > 2)
++  {
++    removeSwapFile(curproc);
++    clearPages(curproc);
++    
++  }
++
++  cprintf("Total page faults for proc %d = %d\n", curproc->pid, curproc->pagefaults);
++  
++  
+   begin_op();
+   iput(curproc->cwd);
+   end_op();
+@@ -530,5 +587,299 @@ procdump(void)
+         cprintf(" %p", pc[i]);
+     }
+     cprintf("\n");
++    cprintf("Page tables:\n");
++    cprintf("\tmemory location of page directory = %p\n", V2P(*(p->pgdir)));
++
++    pde_t *pde;
++    pte_t *pgtab, *pte;
++
++    for(uint i=0;i<NPDENTRIES/2;i++)
++    {
++
++      pde = &p->pgdir[i];
++
++      if((*pde & PTE_U) && (*pde & PTE_P))
++      {
++        uint ppn = PTE_ADDR(*pde) >> PTXSHIFT;
++        cprintf("\tpdir PTE %d, %d\n", i, ppn);
++        cprintf("\t\tmemory location of page table = %p\n", ppn*PGSIZE);
++        for(uint j=0;j<NPTENTRIES;j++)
++        {
++
++            pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
++            pte = &pgtab[j];
++
++            if((*pte & PTE_U) && (*pte & PTE_P))
++            {
++              uint ppn2 =  PTE_ADDR(*pte) >> PTXSHIFT;
++              cprintf("\t\tptbl PTE %d, %d, %p\n", j, ppn2, ppn2*PGSIZE);
++            }
++
++        }
++      }
++
++    }
++
++    cprintf("Page mappings:\n");
++
++
++    for(uint i=0;i<NPDENTRIES/2;i++)
++    {
++
++      pde = &p->pgdir[i];
++
++      if((*pde & PTE_U) && (*pde & PTE_P))
++      {
++        for(uint j=0;j<NPTENTRIES;j++)
++        {
++
++            pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
++            pte = &pgtab[j];
++
++            if((*pte & PTE_U) && (*pte & PTE_P))
++            {
++              uint ppn2 =  PTE_ADDR(*pte) >> PTXSHIFT;
++              cprintf("%d -> %d\n", (i*NPTENTRIES + j), ppn2);
++            }
++
++        }
++
++      }
++
++    }
++
++  }
++}
++
++
++// ========================= functions for supporting paging framework ============================== //
++
++// clear physical page and swap page meta
++
++void clearPages(struct proc *p)
++{
++
++    // clear swap pages
++    for(int i=0;i<MAX_SWAP_PAGES();i++)
++    {
++      p->swappedPages[i] = (struct pagemeta) {0, 0, 0, 0};
++    }
++
++    // clear queue
++    p->qsize = p->qhead = p->qtail = 0;
++    
++
++    for(int i=0;i<MAX_PSYC_PAGES;i++)
++    {
++      p->physicalPages[i] = (struct pagemeta) {0, 0, 0, 0};
++    }
++
++}
++
++// print physical and 
++void printPages(struct proc *p)
++{
++
++  cprintf("proc %d: pgdir = %p\n", p->pid, V2P(*p->pgdir));
++
++  cprintf("Pages in physical memory:\n");
++  for(int i=0;i<MAX_PSYC_PAGES;i++)
++  {
++    if(p->physicalPages[i].present)
++    {
++      cprintf("%d. pgdir = %p va = %d age = %d\n",i+1, V2P(*p->physicalPages[i].pgdir), p->physicalPages[i].va, p->physicalPages[i].age);
++    }
++  }
++
++  cprintf("Pages in swap file:\n");
++  for(int i=0;i<MAX_SWAP_PAGES();i++)
++  {
++    if(p->swappedPages[i].present)
++    {
++      cprintf("%d. pgdir = %p va = %d\n", i+1, p->swappedPages[i].pgdir, p->swappedPages[i].va);
++    }
++  }
++  return ;
++}
++
++// get next physical page to swap out according to algorithm
++int getNextPhysicalPage(struct proc *p)
++{
++  if(p->qsize == 0)
++  {
++    return -1;
++  }
++  else if(algo == FIFO)
++  {
++    return p->qhead;
++  }
++  else if(algo == AGING)
++  {
++    uint min_age;
++    int index = -1;
++    
++    for(int i=0;i<MAX_PSYC_PAGES;i++)
++    {
++      
++      if(p->physicalPages[i].present && (index == -1 || min_age > p->physicalPages[i].age))
++      {
++        min_age = p->physicalPages[i].age;
++        index = i;
++      }
++    }
++    return index;
++  }
++  else
++  {
++    panic("swapping algorithm not defined!");
++    return -1;
++  }
++}
++
++
++
++// add a page to physical page list
++void addPhysicalPage(struct proc *p, pde_t *pgdir, uint va)
++{
++  if(p->qsize == MAX_PSYC_PAGES)
++  {
++    panic("Cant add any more pages!");
++  }
++  else if(algo == FIFO)
++  {
++    int pos = (p->qhead + p->qsize) % MAX_PSYC_PAGES;
++    p->physicalPages[pos] = (struct pagemeta) {pgdir, va, 1, 0};
++    p->qsize++;
++  }
++  else if(algo == AGING)
++  {
++
++    for(int i=0;i<MAX_PSYC_PAGES;i++)
++    {
++      if(p->physicalPages[i].present == 0)
++      {
++          p->physicalPages[i] = (struct pagemeta) {pgdir, va, 1, 0};
++          p->qsize++;
++          break;
++      }
++    }
++
++  }
++  else 
++  {
++    panic("swapping algorithm not defined!");
++
++  }
++}
++
++// remove a physical page
++int removePhysicalPage(struct proc *p, int index)
++{
++  if(!p->physicalPages[index].present)
++  {
++    panic("Page not present!");
++    return -1;
++  }
++  else if(algo == FIFO)
++  {
++    p->physicalPages[index] = (struct pagemeta) {0, 0, 0, 0};
++    p->qsize--;
++    if(p->qhead == index)
++    {
++      p->qhead = (p->qhead + 1) % MAX_PSYC_PAGES;
++     
++    }
++    else 
++    {
++      panic("Page is not the fifo queue front!");
++    }
++  }
++  else if(algo == AGING)
++  {
++    p->physicalPages[index] = (struct pagemeta) {0, 0, 0, 0};
++    p->qsize--;
++  
++  }
++  else 
++  {
++    panic("swapping algorithm not defined!");
++    return -1;
++  }
++  return 0;
++
++}
++// get a physical page from list matching va, pgdir
++int getPhysicalPage(struct proc *p, pde_t *pgdir, uint va)
++{
++  for(int i=0;i<MAX_PSYC_PAGES;i++)
++  {
++    if(p->physicalPages[i].present && p->physicalPages[i].pgdir == pgdir && p->physicalPages[i].va == va)
++    {
++      return i;
++    }
++  }
++  return -1;
++}
++
++// get a swap page from list matching va, pgdir
++int getSwapPage(struct proc *p, pde_t *pgdir, uint va)
++{
++  for(int i=0;i<MAX_SWAP_PAGES();i++)
++  {
++    if(p->swappedPages[i].present && p->swappedPages[i].pgdir == pgdir && p->swappedPages[i].va == va)
++    {
++      return i;
++    }
++  }
++  return -1;
++}
++// remove a swap page
++void removeSwapPage(struct proc *p, int index)
++{
++  if(p->swappedPages[index].present)
++  {
++    p->swappedPages[index] = (struct pagemeta) {0, 0, 0, 0};
++  }
++  else 
++  {
++    panic("Swap page not in list");
++  }
++
++}
++// add a page to swap list
++void addSwapPage(struct proc *p, int index, pde_t *pgdir, uint va)
++{
++  p->swappedPages[index] = (struct pagemeta) {pgdir, va, 1, 0};
++}
++
++// get an empty swap position
++int getEmptySwapPosition(struct proc *p)
++{
++  for(int i=0;i<MAX_SWAP_PAGES();i++)
++  {
++    if(!p->swappedPages[i].present)
++    {
++      return i;
++    }
++  }
++  return -1;
++}
++
++// update PTE_A flags for aging
++void updateAllProcessPTE()
++{
++  if(algo == FIFO)
++  {
++    return ;
+   }
++  struct proc *p;
++  acquire(&ptable.lock);
++  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++    if(p->state == UNUSED)
++      continue;
++
++    clearPTE_A(p);
++
++  }
++  release(&ptable.lock);
+ }
+diff --git a/proc.h b/proc.h
+index 1647114..f509e33 100644
+--- a/proc.h
++++ b/proc.h
+@@ -1,3 +1,4 @@
++
+ // Per-CPU state
+ struct cpu {
+   uchar apicid;                // Local APIC ID
+@@ -32,8 +33,17 @@ struct context {
+   uint eip;
+ };
+ 
++struct pagemeta
++{
++  pde_t *pgdir;
++  uint va;
++  int present;
++  uint age;
++};
++
+ enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++
+ // Per-process state
+ struct proc {
+   uint sz;                     // Size of process memory (bytes)
+@@ -49,6 +59,22 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  //Swap file. must initiate with create swap file
++  struct file *swapFile;			//page file
++  // pages in swap file
++  struct pagemeta swappedPages[MAX_SWAP_PAGES()];
++  // fifo queue for physical pages
++  struct pagemeta physicalPages[MAX_PSYC_PAGES];
++  // head index of circular queue
++  int qhead;
++  // tail index of circular queue
++  int qtail;
++  // queue size
++  int qsize;
++  // total page faults
++  int pagefaults;
++
++
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+@@ -56,3 +82,4 @@ struct proc {
+ //   original data and bss
+ //   fixed-size stack
+ //   expandable heap
++
+diff --git a/syscall.c b/syscall.c
+index ee85261..d5bc63e 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,9 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_aging(void);
++extern int sys_fifo(void);
++
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +129,8 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_aging] sys_aging,
++
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..0e384d2 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_aging  22
++
+diff --git a/sysfile.c b/sysfile.c
+index bfe61b7..bf3848e 100644
+--- a/sysfile.c
++++ b/sysfile.c
+@@ -165,7 +165,7 @@ bad:
+ }
+ 
+ // Is the directory dp empty except for "." and ".." ?
+-static int
++int
+ isdirempty(struct inode *dp)
+ {
+   int off;
+@@ -238,7 +238,7 @@ bad:
+   return -1;
+ }
+ 
+-static struct inode*
++struct inode*
+ create(char *path, short type, short major, short minor)
+ {
+   struct inode *ip, *dp;
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..cf8fa0b 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,10 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++int
++sys_aging(void)
++{
++  enableaging();
++  return 0;
++}
+diff --git a/trap.c b/trap.c
+index 41c66eb..7a12480 100644
+--- a/trap.c
++++ b/trap.c
+@@ -11,6 +11,7 @@
+ // Interrupt descriptor table (shared by all CPUs).
+ struct gatedesc idt[256];
+ extern uint vectors[];  // in vectors.S: array of 256 entry pointers
++int clear = 0;
+ struct spinlock tickslock;
+ uint ticks;
+ 
+@@ -47,15 +48,24 @@ trap(struct trapframe *tf)
+   }
+ 
+   switch(tf->trapno){
+-  case T_IRQ0 + IRQ_TIMER:
++  case T_IRQ0 + IRQ_TIMER:{
+     if(cpuid() == 0){
+       acquire(&tickslock);
+       ticks++;
+       wakeup(&ticks);
+       release(&tickslock);
++
++      if(myproc() && myproc()->pid > 2)
++      {
++        updateAllProcessPTE();
++        
++      }
++      
+     }
+     lapiceoi();
++    
+     break;
++  }
+   case T_IRQ0 + IRQ_IDE:
+     ideintr();
+     lapiceoi();
+@@ -77,6 +87,23 @@ trap(struct trapframe *tf)
+             cpuid(), tf->cs, tf->eip);
+     lapiceoi();
+     break;
++  case T_PGFLT:{
++
++    struct proc *p = myproc();
++    
++    if(p && p->pid > 2 && ((tf->cs & 3) == 3)){
++       p->pagefaults++;
++      if(checkPageOut(p, rcr2()))
++      {
++        swapin(p, rcr2());
++        break;
++      }
++    }
++    else 
++    {
++      cprintf("Hard Page fault\n");
++    }
++  }
+ 
+   //PAGEBREAK: 13
+   default:
+@@ -103,10 +130,17 @@ trap(struct trapframe *tf)
+   // Force process to give up CPU on clock tick.
+   // If interrupts were on while locks held, would need to check nlock.
+   if(myproc() && myproc()->state == RUNNING &&
+-     tf->trapno == T_IRQ0+IRQ_TIMER)
+-    yield();
++     tf->trapno == T_IRQ0+IRQ_TIMER){
++       // add here 
++      
++
++      
++
++      yield();
++    }
+ 
+   // Check if the process has been killed since we yielded
+   if(myproc() && myproc()->killed && (tf->cs&3) == DPL_USER)
+     exit();
+ }
++
+diff --git a/types.h b/types.h
+index e4adf64..71b4a67 100644
+--- a/types.h
++++ b/types.h
+@@ -2,3 +2,6 @@ typedef unsigned int   uint;
+ typedef unsigned short ushort;
+ typedef unsigned char  uchar;
+ typedef uint pde_t;
++typedef uint pte_t;
++
++
+diff --git a/user.h b/user.h
+index 4f99c52..48fd1da 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int aging(void);
++
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..5de77aa 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,4 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(aging)
+diff --git a/vm.c b/vm.c
+index 7134cff..7c1d79b 100644
+--- a/vm.c
++++ b/vm.c
+@@ -10,6 +10,7 @@
+ extern char data[];  // defined by kernel.ld
+ pde_t *kpgdir;  // for use in scheduler()
+ 
++
+ // Set up CPU's kernel segment descriptors.
+ // Run once on entry on each CPU.
+ void
+@@ -229,6 +230,8 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+   if(newsz < oldsz)
+     return oldsz;
+ 
++  struct proc *p = myproc();
++
+   a = PGROUNDUP(oldsz);
+   for(; a < newsz; a += PGSIZE){
+     mem = kalloc();
+@@ -244,6 +247,15 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+       kfree(mem);
+       return 0;
+     }
++
++    if(p->pid > 2)
++    {
++      if(p->qsize == MAX_PSYC_PAGES)
++      {
++        swapout(p);
++      }
++      addPhysicalPage(p, pgdir, (uint) a);
++    }
+   }
+   return newsz;
+ }
+@@ -258,6 +270,7 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+   pte_t *pte;
+   uint a, pa;
+ 
++  struct proc *p = myproc();
+   if(newsz >= oldsz)
+     return oldsz;
+ 
+@@ -266,13 +279,33 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+     pte = walkpgdir(pgdir, (char*)a, 0);
+     if(!pte)
+       a = PGADDR(PDX(a) + 1, 0, 0) - PGSIZE;
++    else if((*pte & PTE_PG) != 0 && p->pid > 2)
++    {
++      int swapPageIndex = getSwapPage(p, pgdir, a);
++      if(swapPageIndex != -1)
++      {
++        removeSwapPage(p, swapPageIndex); 
++      }
++    }
+     else if((*pte & PTE_P) != 0){
++      
++      if(p->pid > 2)
++      {
++        int phyPageIndex = getPhysicalPage(p, pgdir, a);
++        if(phyPageIndex != -1)
++        {
++          removePhysicalPage(p, phyPageIndex);
++        }
++        
++      }
++
+       pa = PTE_ADDR(*pte);
+       if(pa == 0)
+         panic("kfree");
+       char *v = P2V(pa);
+       kfree(v);
+       *pte = 0;
++      
+     }
+   }
+   return newsz;
+@@ -325,6 +358,15 @@ copyuvm(pde_t *pgdir, uint sz)
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
+       panic("copyuvm: pte should exist");
++
++    if((*pte & PTE_PG))
++    {
++      pte_t *pte2 = walkpgdir(d, (char *)i, 0);
++      uint flags = (PTE_FLAGS(*pte2) | PTE_PG | PTE_U | PTE_W) & (~PTE_P);
++      *pte2 = flags;
++      continue;
++
++    }
+     if(!(*pte & PTE_P))
+       panic("copyuvm: page not present");
+     pa = PTE_ADDR(*pte);
+@@ -392,3 +434,156 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
+ //PAGEBREAK!
+ // Blank page.
+ 
++// ========================= functions for supporting paging framework ============================== //
++
++// copy page meta data from parent to child
++void copyPagesFromParent(struct proc *parent, struct proc *child)
++{
++  for(int i=0;i<MAX_PSYC_PAGES;i++)
++  {
++    child->physicalPages[i] = (struct pagemeta) {child->pgdir, parent->physicalPages[i].va, parent->physicalPages[i].present, 0};
++    
++  }
++  for(int i=0;i<MAX_SWAP_PAGES();i++)
++  {
++    child->swappedPages[i] = (struct pagemeta) {child->pgdir, parent->swappedPages[i].va, parent->swappedPages[i].present, 0};
++    
++  }
++}
++
++void swapout(struct proc *p)
++{
++
++  
++  // get the next swap out page from physical page list
++  int swapoutIndex = getNextPhysicalPage(p);
++
++  if(swapoutIndex == -1)
++  {
++    panic("Can't find page to swap out!");
++    return ;
++  }
++  struct pagemeta swapoutpage = p->physicalPages[swapoutIndex];
++
++  //cprintf("Swapping out %d for proc %d pgdir %p\n", swapoutpage.va, p->pid, V2P(*swapoutpage.pgdir));
++
++
++  // get place in swap file to write this page
++  int swapOutPosition = getEmptySwapPosition(p);
++
++  if(swapOutPosition == -1)
++  {
++    panic("No place in swap file!");
++    return;
++
++  }
++  pte_t *pte = walkpgdir(swapoutpage.pgdir, (char *)swapoutpage.va, 0);
++  
++  // update pagetable
++  uint pa = PTE_ADDR(*pte);
++  uint flags = (PTE_FLAGS(*pte) | PTE_PG | PTE_U | PTE_W) & (~PTE_P);
++  *(pte) = (pa | flags);
++
++  // write to swap file
++  writeToSwapFile(p, (char *)P2V(PTE_ADDR(*pte)), swapOutPosition*PGSIZE, PGSIZE);
++
++  // remove from physical page list
++  removePhysicalPage(p, swapoutIndex);
++
++  // add to swap page list
++  addSwapPage(p, swapOutPosition, swapoutpage.pgdir, swapoutpage.va);
++
++  //cprintf("Done swapping out %d for proc %d pgdir %p\n", swapoutpage.va, p->pid, V2P(*swapoutpage.pgdir));
++  
++
++  // free the memory
++  char *remv = (char *) P2V(PTE_ADDR(*pte));
++
++  kfree(remv);
++
++  //cprintf("Freed memory\n");
++  return ;
++}
++
++void swapin(struct proc *p, uint va)
++{
++  va = PGROUNDDOWN(va);
++
++  //cprintf("Swapping in %d for proc %d pgdir %p\n", va, p->pid, V2P(*p->pgdir));
++  
++  // get the page to swap in from proc's list
++  int swapinIndex = getSwapPage(p, p->pgdir, va);
++  if(swapinIndex == -1)
++  {
++    panic("Cant Swap in! Page not in list!");
++    return ;
++  }
++  struct pagemeta swapinpage = p->swappedPages[swapinIndex];
++
++  // allocate space for the new page
++  char *mem = kalloc();
++  readFromSwapFile(p, mem, swapinIndex * PGSIZE, PGSIZE);
++
++  // remove from swap page list
++  removeSwapPage(p, swapinIndex);
++
++  // update page table
++  // try map pages if this doesnt work
++  pte_t *pte = walkpgdir(swapinpage.pgdir, (char *)swapinpage.va, 0);
++  uint pa = V2P(mem);
++  uint flags = (PTE_FLAGS(*pte) | PTE_P | PTE_U | PTE_W) & (~PTE_PG);
++  *(pte) = (pa | flags);
++
++  
++  // check if swapping out is needed
++  if(p->qsize == MAX_PSYC_PAGES)
++  {
++    swapout(p);
++  }
++
++  
++
++  // add to physical page list
++  addPhysicalPage(p, swapinpage.pgdir, swapinpage.va);
++
++  //cprintf("Done Swapping in %d for proc %d pgdir %p\n", va, p->pid, V2P(*p->pgdir));
++  
++  
++
++}
++
++// check if the address is in swap file
++int checkPageOut(struct proc *p, uint va)
++{
++  //cprintf("checking page out for %d proc %d...\n", va, p->pid);
++  
++  if(p->pid > 2){
++    va = PGROUNDDOWN(va);
++    pte_t *pte = walkpgdir(p->pgdir, (char *)va, 0);
++    
++    if(pte && (*pte & PTE_PG) && !(*pte & PTE_P))
++      return 1;
++  }
++  return 0;
++}
++
++// clears the PTE_A flag for all processes
++void clearPTE_A(struct proc *p)
++{
++ 
++    for(int i=0;i<MAX_PSYC_PAGES;i++)
++    {
++      if(p->physicalPages[i].present)
++      {
++        pte_t *pte = walkpgdir(p->physicalPages[i].pgdir, (char *) p->physicalPages[i].va, 0);
++        p->physicalPages[i].age >>= 1;
++        if((*pte) & PTE_A)
++        {
++          p->physicalPages[i].age |= (1<<(AGE_BITS-1));
++        }
++        (*pte) &= (~PTE_A);
++      }
++    }
++
++  
++}
